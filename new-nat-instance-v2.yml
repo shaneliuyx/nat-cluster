@@ -1,0 +1,211 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template to create ASG with 2 Spot EC2 instances in 2 AZs'
+Parameters:
+  InstanceType:
+    Description: 'EC2 instance type'
+    Type: String
+    Default: 't4g.micro'
+    AllowedValues:
+      - 't4g.micro' #5G
+      - 'c6g.medium' #10G
+      # Add more instance types as needed
+  VPCID:
+    Description: 'VPC ID'
+    Type: AWS::EC2::VPC::Id
+  VPCCIDR:
+    Description: 'VPC CIDR'
+    Type: String
+  SubnetIDs:
+    Description: 'Subnet ID'
+    Type: List<AWS::EC2::Subnet::Id>
+  LatestAmiId:
+    Description: 'Amazon Linux 2 ARM64 AMI ID'
+    Type: 'AWS::SSM::Parameter::Value<String>'
+    Default: '/aws/service/ami-amazon-linux-latest/al2023-ami-minimal-kernel-6.1-arm64'
+
+
+Resources:
+  SSMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: 'nat-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ec2:*'
+                Resource: '*'            
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref SSMRole
+  
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPCID
+      GroupDescription: 'Enable SSH access via port 22'
+      SecurityGroupIngress:
+        - IpProtocol: -1
+          CidrIp: !Ref VPCCIDR
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      MinSize: "2"
+      MaxSize: "2"
+      VPCZoneIdentifier: !Ref SubnetIDs
+      MixedInstancesPolicy:
+        InstancesDistribution:
+          OnDemandBaseCapacity: 0
+          OnDemandPercentageAboveBaseCapacity: 0
+          SpotAllocationStrategy: "lowest-price"
+        LaunchTemplate:
+          LaunchTemplateSpecification:
+            LaunchTemplateId: !Ref LaunchTemplate
+            Version: !GetAtt LaunchTemplate.LatestVersionNumber
+  LaunchTemplate:
+    Type: "AWS::EC2::LaunchTemplate"
+    Properties:
+      LaunchTemplateName: "SpotInstanceLaunchTemplate"
+      LaunchTemplateData:
+        InstanceType: !Ref InstanceType
+        ImageId: !Ref LatestAmiId 
+        IamInstanceProfile:
+          Name: !Ref InstanceProfile
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: true
+            DeleteOnTermination: true
+            Groups:
+              - !Ref SecurityGroup
+        UserData:
+          Fn::Base64: |
+              #cloud-config
+              cloud_final_modules:
+              - [scripts-user, always]
+
+              runcmd:
+                - |
+                  #!/bin/bash
+
+                  # Install awscurl and pip if not already installed
+
+                  if ! command -v pip &> /dev/null; then
+                    yum install -y pip
+                  fi
+
+                  if ! command -v awscurl &> /dev/null; then
+                      pip install awscurl
+                  fi
+
+                  #BASH_ACTION="ModifyInstanceAttribute"
+                  BASH_SOURCE_DEST_CHECK="false"
+                  #VERSION="2016-11-15"
+                  # Request a token for IMDSv2
+                  tkn=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+
+                  # Extract AWS temporary credentials from instance metadata using the token
+                  crd=$(curl -H "X-aws-ec2-metadata-token: $tkn" -s http://169.254.169.254/latest/meta-data/iam/security-credentials/)
+                  ak=$(curl -H "X-aws-ec2-metadata-token: $tkn" -s http://169.254.169.254/latest/meta-data/iam/security-credentials/${crd} | grep AccessKeyId | cut -d'"' -f4)
+                  sk=$(curl -H "X-aws-ec2-metadata-token: $tkn" -s http://169.254.169.254/latest/meta-data/iam/security-credentials/${crd} | grep SecretAccessKey | cut -d'"' -f4)
+                  ss_tkn=$(curl -H "X-aws-ec2-metadata-token: $tkn" -s http://169.254.169.254/latest/meta-data/iam/security-credentials/${crd} | /bin/sed -n 's/.*"Token" : "\(.*\)",/\1/p')
+                  mac_id=$(curl -H "X-aws-ec2-metadata-token: $tkn" -s  http://169.254.169.254/latest/meta-data/network/interfaces/macs)
+                  eni_id=$(curl -H "X-aws-ec2-metadata-token: $tkn" -s http://169.254.169.254/latest/meta-data/network/interfaces/macs/{$mac_id}interface-id)
+
+                  #Get az information
+                  az=$(curl -H "X-aws-ec2-metadata-token: $tkn" -s http://169.254.169.254/latest/meta-data/placement/availability-zone/)
+                  if [ $? -ne 0 ]
+                  then
+                      exit 255
+                  fi
+
+                  # Validate the az
+                  if [[ ! "${az}" =~ ^([a-z]+-){2,3}[0-9][a-z]$ ]]
+                  then
+                      exit 255
+                  fi
+
+                  #Extract BASH_region from az
+                  rgn=$(/bin/echo "${az}" | /bin/sed -n 's/\(\([a-z]\+-\)\+[0-9]\+\).*/\1/p')
+
+                  # Get domain_name for calls
+                  domain_name=$(curl -H "X-aws-ec2-metadata-token: $tkn" -s http://169.254.169.254/latest/meta-data/services/domain/)
+                  if [ $? -ne 0 ]
+                  then
+                      exit 255
+                  fi
+
+                  endpoint_name="ec2.${rgn}.${domain_name}"
+                  ec2_pnt="https://${endpoint_name}"
+
+
+                  # Get the instance ID and availability az
+                  instance_id=$(curl -H "X-aws-ec2-metadata-token: $tkn" -s http://169.254.169.254/latest/meta-data/instance-id)
+
+                  counter=0
+                  while [ $counter -lt 10 ]; do
+                      output=$(awscurl --service ec2 \
+                        --region ${rgn}\
+                        --access_key ${ak}\
+                        --secret_key ${sk}\
+                        --session_token ${ss_tkn}\
+                      "${ec2_pnt}/?Action=ModifyInstanceAttribute&InstanceId=${instance_id}&SourceDestCheck.Value=${BASH_SOURCE_DEST_CHECK}&Version=2016-11-15")
+                      
+                      # 检查输出是否为成功消息
+                      if [[ $output == *"<return>true</return>"* ]]; then
+                          echo "Success!"
+                          break
+                      else
+                          echo "Attempt $(($counter + 1)) failed. Retrying..."
+                          counter=$((counter + 1))
+                          sleep 2 # 等待2秒再试
+                      fi
+                  done
+
+                  counter=0
+                  while [ $counter -lt 10 ]; do
+                      output=$(awscurl --service ec2 \
+                        --region ${rgn}\
+                        --access_key ${ak}\
+                        --secret_key ${sk}\
+                        --session_token ${ss_tkn}\
+                        "${ec2_pnt}/?Action=CreateTags&ResourceId.1=${instance_id}&Tag.1.Key=Name&Tag.1.Value=nat(${eni_id: -4:4})-${az}&Version=2016-11-15")
+
+                      # 检查输出是否为成功消息
+                      if [[ $output == *"<return>true</return>"* ]]; then
+                          echo "Success!"
+                          break
+                      else
+                          echo "Attempt $(($counter + 1)) failed. Retrying..."
+                          counter=$((counter + 1))
+                          sleep 2 # 等待2秒再试
+                      fi
+                  done
+                  # NAT configuration
+                  sudo sysctl -w net.ipv4.ip_forward=1 | sudo tee -a /etc/sysctl.conf
+                  sudo yum install -y nftables
+                  sudo nft add table nat
+                  sudo nft -- add chain nat prerouting { type nat hook prerouting priority -100 \; }
+                  sudo nft add chain nat postrouting { type nat hook postrouting priority 100 \; }
+                  sudo nft add rule nat postrouting oifname "$(ip -o link show device-number-0 | awk -F': ' '{print $2}')" masquerade
+                  # NAT設定保存
+                  sudo nft list table nat | sudo tee /etc/nftables/al2023-nat.nft
+                  echo 'include "/etc/nftables/al2023-nat.nft"' | sudo tee -a /etc/sysconfig/nftables.conf
+                  # 起動＋自動起動設定
+                  sudo systemctl start nftables
+                  sudo systemctl enable nftables
